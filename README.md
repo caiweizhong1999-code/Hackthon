@@ -100,7 +100,7 @@ brew install libomp                # macOS only
 streamlit run app.py
 ```
 
-The app opens at 替换这里. The first time it runs, Streamlit may ask for an email address; just
+The app opens at https://h6wxdz2aqqlir2asjdgtrr.streamlit.app/. The first time it runs, Streamlit may ask for an email address; just
 press **Enter** to skip.
 
 **Optional: enable Claude parsing**
