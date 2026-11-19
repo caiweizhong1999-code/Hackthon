@@ -48,30 +48,31 @@ def check_data(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warns: list[str] = []
     if df.empty:
-        return ["数据为空"], warns
+        return ["The dataset is empty"], warns
 
     outcomes = available_outcomes(df)
     if not outcomes:
-        needed = {k: list(v) for k, v in OUTCOME_MAP.items()}
-        return [f"没有找到任何 outcome 所需的列。需要的列: {needed};当前列: {list(df.columns)}"], warns
+        return [("Could not find a survival time column and a 0/1 event column. Expected pairs such as "
+                 "os_time/os_event or pfs_time/pfs_event, or columns like time_months/event. "
+                 f"Found columns: {list(df.columns)}. Choose them under Settings → Survival columns in the sidebar.")], warns
 
     for name in outcomes:
         t_col, e_col = OUTCOME_MAP[name]
         if not pd.api.types.is_numeric_dtype(df[t_col]):
-            errors.append(f"时间列 '{t_col}' 不是数值类型(可能含有文本),请先清洗")
+            errors.append(f"Time column '{t_col}' is not numeric (it may contain text); please clean it first")
         vals = set(df[e_col].dropna().unique())
         if not vals <= {0, 1}:
-            errors.append(f"事件列 '{e_col}' 必须是 0/1(1=发生事件),实际取值: {sorted(map(str, vals))[:6]}")
+            errors.append(f"Event column '{e_col}' must be 0/1 (1 = event occurred); found values: {sorted(map(str, vals))[:6]}")
         elif pd.api.types.is_numeric_dtype(df[t_col]):
             if (df[t_col].dropna() < 0).any():
-                errors.append(f"时间列 '{t_col}' 含负数")
+                errors.append(f"Time column '{t_col}' contains negative values")
             n_bad = int(df[[t_col, e_col]].isna().any(axis=1).sum())
             if n_bad:
-                warns.append(f"{name}: {n_bad} 行的 {t_col}/{e_col} 缺失,分析时会被剔除")
+                warns.append(f"{name}: {n_bad} rows with missing {t_col}/{e_col} will be dropped")
             if df[e_col].sum() < 10:
-                warns.append(f"{name}: 事件数只有 {int(df[e_col].sum())},结果会很不稳定")
+                warns.append(f"{name}: only {int(df[e_col].sum())} events; results will be unstable")
     if len(df) < 30:
-        warns.append(f"样本量只有 {len(df)}")
+        warns.append(f"Only {len(df)} patients in the dataset")
     return errors, warns
 
 
@@ -129,6 +130,9 @@ def run_parsed(query: dict[str, Any], df: pd.DataFrame, question: str = "", sour
         out.error = str(e)
         return out
     out.result = res
+    if any("fell back to the default query" in n for n in out.parsed.notes):
+        out.warnings.append("Your question could not be fully interpreted, so the default survival curve is shown. "
+                            "Check the Parser notes and edit the query on the right if needed.")
     out.warnings += res.warnings
 
     if res.outcome:
@@ -137,16 +141,16 @@ def run_parsed(query: dict[str, Any], df: pd.DataFrame, question: str = "", sour
             out.warnings += out.report.warnings
         except ValueError as e:
             if res.plot_type == "km_curve":
-                out.error = f"生存分析失败: {e}"
+                out.error = f"Survival analysis failed: {e}"
                 return out
-            out.warnings.append(f"生存汇总未能生成: {e}")
+            out.warnings.append(f"Survival summary could not be generated: {e}")
 
     value_col, x_col = pick_columns(res, question)
     try:
         out.fig = render(res, value_col=value_col, x_col=x_col, time_unit=time_unit)
         plt.close(out.fig)          # 从 pyplot 注册表摘掉,避免 Streamlit 里反复运行后内存堆积
     except (QueryError, ValueError, KeyError) as e:
-        out.error = f"画图失败: {e}"
+        out.error = f"Plot failed: {e}"
     return out
 
 
@@ -193,18 +197,21 @@ if __name__ == "__main__":
     print("check_data:", errs, warns)
     assert not errs
 
-    questions = [
-        "show overall survival for patients older than 65 by treatment",
-        "65岁以上女性患者按治疗方案分组的总生存曲线",
-        "progression-free survival, stage III or IV, split by sex",
-        "distribution of age by sex",
-        "compare Drug A and Placebo survival as a boxplot",
-        "How does mean survival time change with age?",
-        "patients younger than 50",
+    questions = [   # (问题, 期望的图类型)
+        ("show overall survival for patients older than 65 by treatment", "km_curve"),
+        ("65岁以上女性患者按治疗方案分组的总生存曲线", "km_curve"),
+        ("progression-free survival, stage III or IV, split by sex", "km_curve"),
+        ("distribution of age by sex", "histogram"),
+        ("compare Drug A and Placebo survival as a boxplot", "boxplot"),
+        ("How does mean survival time change with age?", "trend"),
+        ("patients younger than 50", "histogram"),
     ]
-    for q in questions:
+    for q, expected in questions:
         out = run_question(q, df)
         assert out.error is None and out.fig is not None, (q, out.error)
+        assert out.result.plot_type == expected, (
+            f"图类型不符: {q!r} 期望 {expected},实际 {out.result.plot_type}。"
+            f"请检查实际导入的 nl_parser_v2: python -c \"import nl_parser_v2; print(nl_parser_v2.__file__)\"")
         lr = out.report.logrank if out.report else None
         print(f"{q[:55]:<57} {out.parsed.source:<6} {out.result.plot_type:<10} "
               f"n={out.result.n_selected:<4} {lr if lr else ''}")

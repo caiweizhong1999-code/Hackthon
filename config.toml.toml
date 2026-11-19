@@ -1,0 +1,14 @@
+# Light main area + dark navy sidebar. Put this file at <project root>/.streamlit/config.toml
+[theme]
+base = "light"
+primaryColor = "#5b3fd6"
+backgroundColor = "#f3f4fb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1d2143"
+font = "sans serif"
+
+# Sidebar theming needs Streamlit >= 1.46; older versions ignore it (the CSS in ui.py still colors the sidebar).
+[theme.sidebar]
+backgroundColor = "#171a47"
+secondaryBackgroundColor = "#252a63"
+textColor = "#e6e8f8"

@@ -56,9 +56,21 @@ DEFAULT_PARAMS: dict[str, Any] = {
 }
 
 
+def _looks_like_date(s: pd.Series) -> bool:
+    """非数值列里 90% 以上能解析成日期,就当作日期列。"""
+    vals = s.dropna().astype(str).head(50)
+    if len(vals) == 0:
+        return False
+    try:
+        parsed = pd.to_datetime(vals, errors="coerce", format="mixed")
+    except (TypeError, ValueError):      # 老版本 pandas 没有 format="mixed"
+        return False
+    return float(parsed.notna().mean()) >= 0.9
+
+
 def _require_xgb() -> None:
     if xgb is None:
-        raise ImportError("需要安装 xgboost:pip install xgboost")
+        raise ImportError("xgboost is required: pip install xgboost")
 
 
 # ============================================================================
@@ -120,7 +132,7 @@ class Encoder:
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         missing = [c for c in [*self.numeric, *self.categorical] if c not in df.columns]
         if missing:
-            raise ValueError(f"输入数据缺少特征列: {missing}")
+            raise ValueError(f"Input data is missing feature columns: {missing}")
         out: dict[str, np.ndarray] = {}
         for c in self.numeric:
             out[c] = pd.to_numeric(df[c], errors="coerce").to_numpy(float)
@@ -177,7 +189,7 @@ class SurvivalXGB:
     def __init__(self, outcome: str = "overall_survival", features: list[str] | None = None,
                  params: dict[str, Any] | None = None, seed: int = 42):
         if outcome not in OUTCOME_MAP:
-            raise ValueError(f"未知 outcome '{outcome}',可选: {sorted(OUTCOME_MAP)}")
+            raise ValueError(f"Unknown outcome '{outcome}'. Available: {sorted(OUTCOME_MAP)}")
         self.outcome = outcome
         self.time_col, self.event_col = OUTCOME_MAP[outcome]
         self.features = features
@@ -204,6 +216,8 @@ class SurvivalXGB:
             numeric = pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s)
             if not numeric and s.nunique() > MAX_CATEGORICAL_UNIQUE:
                 continue       # 疑似 ID / 自由文本
+            if not numeric and _looks_like_date(s):
+                continue       # 入组日期等:当成分类特征既无意义,又容易泄漏时间信息
             feats.append(c)
         return feats
 
@@ -213,12 +227,12 @@ class SurvivalXGB:
         data = df.dropna(subset=[self.time_col, self.event_col]).copy()
         e = data[self.event_col].to_numpy(int)
         if len(data) < 30 or e.sum() < 10:
-            raise ValueError(f"样本太少:n={len(data)},事件数={int(e.sum())}(至少需要 30 例、10 个事件)")
+            raise ValueError(f"Too few samples: n={len(data)}, events={int(e.sum())} (need at least 30 patients and 10 events)")
 
         feats = self.features or self._default_features(data)
         missing = [c for c in feats if c not in data.columns]
         if missing:
-            raise ValueError(f"特征列不存在: {missing}")
+            raise ValueError(f"Feature columns not found: {missing}")
         self.features = feats
         self.encoder = Encoder.fit(data, feats)
         X = self.encoder.transform(data)
@@ -276,7 +290,7 @@ class SurvivalXGB:
     # --------------------------------------------------------------- 预测
     def _check_fitted(self) -> None:
         if self.booster is None or self.encoder is None:
-            raise RuntimeError("模型尚未训练,请先调用 fit() 或 load()")
+            raise RuntimeError("The model is not trained yet; call fit() or load() first")
 
     def _iter_range(self) -> tuple[int, int]:
         return (0, int(self.best_iteration_ or 0))
@@ -429,7 +443,7 @@ def plot_shap_local(sr: ShapResult, row: int = 0, max_display: int = 8):
 
     top = sr.top_contributors(row, k=max_display).iloc[::-1]
     labels = [f"{f} = {v:.3g}" if not np.isnan(v) else f"{f} = NA" for f, v in zip(top["feature"], top["value"])]
-    colors = ["#dc2626" if s > 0 else "#2563eb" for s in top["shap"]]
+    colors = ["#ef5b73" if s > 0 else "#3b82f6" for s in top["shap"]]
     margin = float(sr.margin().iloc[row])
     fig, ax = plt.subplots(figsize=(8, 0.5 * len(top) + 1.8))
     ax.barh(labels, top["shap"], color=colors)

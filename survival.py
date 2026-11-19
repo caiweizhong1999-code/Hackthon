@@ -38,15 +38,15 @@ def _clean(time: Iterable[float], event: Iterable[int]) -> tuple[np.ndarray, np.
     t = np.asarray(list(time) if not hasattr(time, "__array__") else time, dtype=float)
     e = np.asarray(list(event) if not hasattr(event, "__array__") else event, dtype=float)
     if t.shape != e.shape:
-        raise ValueError("time 和 event 长度不一致")
+        raise ValueError("time and event must have the same length")
     ok = ~(np.isnan(t) | np.isnan(e))
     t, e = t[ok], e[ok]
     if len(t) == 0:
-        raise ValueError("没有可用样本(time/event 全部缺失)")
+        raise ValueError("No usable samples (time/event all missing)")
     if (t < 0).any():
-        raise ValueError("time 不能为负数")
+        raise ValueError("time cannot be negative")
     if not np.isin(e, (0, 1)).all():
-        raise ValueError("event 必须是 0/1(1=发生事件,0=删失)")
+        raise ValueError("event must be 0/1 (1 = event occurred, 0 = censored)")
     return t, e.astype(int)
 
 
@@ -73,7 +73,7 @@ class KMCurve:
     def at_risk(self, t: float, raw_time: np.ndarray | None = None) -> int:
         """t 时刻的风险人数;需要原始 time 数组(KMCurve 本身不保存)。"""
         if raw_time is None:
-            raise ValueError("需要传入原始 time 数组")
+            raise ValueError("The raw time array is required")
         return int(np.sum(np.asarray(raw_time) >= t))
 
 
@@ -167,7 +167,7 @@ def logrank_test(groups: dict[str, tuple[Iterable[float], Iterable[int]]]) -> Lo
     groups: {组名: (time, event)}。少于 2 组抛 ValueError。
     """
     if len(groups) < 2:
-        raise ValueError("log-rank 至少需要 2 组")
+        raise ValueError("Log-rank needs at least 2 groups")
     names = list(groups)
     k = len(names)
     cleaned = [_clean(*groups[g]) for g in names]
@@ -261,7 +261,7 @@ def analyze(result: Any, landmarks: Iterable[float] = ()) -> SurvivalReport:
     一组 -> 只有 KM 和汇总;>=2 组 -> 加 log-rank;>=3 组 -> 加两两比较。
     """
     if not getattr(result, "time_col", None):
-        raise ValueError("该查询没有 outcome,无法做生存分析")
+        raise ValueError("This query has no outcome, so survival analysis is not possible")
     t_col, e_col = result.time_col, result.event_col
     groups = result.groups
 
@@ -273,13 +273,13 @@ def analyze(result: Any, landmarks: Iterable[float] = ()) -> SurvivalReport:
     if len(groups) >= 2:
         lr = logrank_test(raw)
         if np.isnan(lr.p_value):
-            warnings.append("log-rank 的 p 值无法计算(缺 scipy 或协方差矩阵奇异)")
+            warnings.append("Log-rank p-value could not be computed (scipy missing or singular covariance matrix)")
     if len(groups) >= 3:
         pw = pairwise_logrank(raw)
 
     for n, c in curves.items():
         if c.events == 0:
-            warnings.append(f"分组 '{n}' 没有事件发生,KM 曲线是一条水平线")
+            warnings.append(f"Group '{n}' has no events; its KM curve is a flat line")
 
     return SurvivalReport(curves=curves, summary=summarize_groups(groups, t_col, e_col, landmarks),
                           logrank=lr, pairwise=pw, warnings=warnings)

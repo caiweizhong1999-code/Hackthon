@@ -1,14 +1,16 @@
 """
-app.py — Survival Explorer (Streamlit)
+app.py — AI-Powered Clinical Data Explorer (Streamlit)
 
 运行:  streamlit run app.py
 目录:  app.py 放项目根目录;其余模块放 src/(或和 app.py 同级)均可。
+主题:  把 streamlit_config.toml 放到 .streamlit/config.toml(浅色主题 + 深色侧边栏)。
 
-流程: 上传 CSV(或加载演示数据) -> 输入问题 -> Parsed Query 面板 -> KM/分布/趋势图 + 汇总表
-      -> Risk model 页:XGBoost 训练 + SHAP + 个体生存曲线
+流程: 上传 CSV(或加载演示数据) -> 输入问题 -> Parsed Query -> KM/分布/趋势图 + 汇总表
+      -> Patient Risk Prediction:XGBoost 训练 + 单个病人风险预测 + SHAP 解释
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import sys
@@ -24,22 +26,31 @@ for _p in (_HERE, _HERE / "src"):
 
 import matplotlib.pyplot as plt  # noqa: E402
 
+import ui  # noqa: E402
 from model import SurvivalXGB, plot_shap_bar, plot_shap_local, plot_shap_summary  # noqa: E402
 from pipeline import (  # noqa: E402
     available_outcomes, check_data, make_demo_data, run_parsed, run_question,
 )
 from plots import fig_to_png_bytes  # noqa: E402
+from query_engine import OUTCOME_MAP, configure_outcomes  # noqa: E402
 
-st.set_page_config(page_title="Survival Explorer", layout="wide")
+st.set_page_config(page_title="AI Clinical Data Explorer", layout="wide")
+st.markdown(ui.CSS, unsafe_allow_html=True)
 
+PAGES = ["Overview", "Cohort Explorer", "Risk Prediction", "About"]
 EXAMPLES = [
     "Show overall survival for patients older than 65, split by treatment",
-    "65岁以上女性患者按治疗方案分组的总生存曲线",
+    "Overall survival for women aged 40 to 60, grouped by stage",
     "Progression-free survival for stage III or IV patients by sex",
     "Distribution of age by sex",
     "Compare Drug A and Placebo survival time as a boxplot",
     "How does mean survival time change with age?",
 ]
+EVENT_LABELS = {"overall_survival": "Mortality", "progression_free_survival": "Progression-or-death"}
+
+
+def md(html: str) -> None:
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------
@@ -52,7 +63,8 @@ def load_dataframe(uploaded) -> pd.DataFrame:
 def _set_df(df: pd.DataFrame, name: str) -> None:
     st.session_state["df"] = df
     st.session_state["df_name"] = name
-    for k in ("out", "model", "shap", "shap_df", "query_json", "risk_out"):   # 换数据就清掉旧结果
+    for k in ("out", "model", "shap", "shap_df", "query_json", "risk_out", "patient_pred",
+              "sv_time", "sv_event"):   # 换数据就清掉旧结果和手动选的生存列
         st.session_state.pop(k, None)
 
 
@@ -78,13 +90,25 @@ def _parse_landmarks(text: str) -> tuple[float, ...]:
         return (12.0, 24.0)
 
 
+def _clean_query_view(q) -> dict:
+    """面板展示用:容忍用户手写 JSON 里缺字段/格式不对,不让界面崩。"""
+    if not isinstance(q, dict):
+        return {"filters": [], "outcome": None, "group_by": None, "plot_type": "?"}
+    filters = [f for f in (q.get("filters") or []) if isinstance(f, dict) and {"column", "op", "value"} <= f.keys()]
+    return {**q, "filters": filters}
+
+
 # ============================================================================
 # 侧边栏
 # ============================================================================
 with st.sidebar:
-    st.header("Data")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    st.button("Load demo data", on_click=_use_demo)
+    md(ui.logo_html())
+    md(ui.side_label("Navigation"))
+    page = st.radio("Navigation", PAGES, key="nav", label_visibility="collapsed")
+
+    md(ui.side_label("Dataset"))
+    uploaded = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+    st.button("Load demo data", key="demo_side", on_click=_use_demo)
     if uploaded is not None:
         sig = (uploaded.name, getattr(uploaded, "size", None))
         if st.session_state.get("upload_sig") != sig:
@@ -94,41 +118,34 @@ with st.sidebar:
             except Exception as e:   # 任何读取/校验异常都友好提示
                 st.error(f"Could not read the file: {e}")
 
-    st.header("Parsing")
-    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    api_key = st.text_input("Anthropic API key", type="password", value=env_key)
-    use_llm = st.checkbox("Use LLM parsing", value=bool(env_key))
-    st.caption("Off, or on any LLM error → rule-based parser (works offline).")
+    md(ui.side_label("Settings"))
+    with st.expander("Parsing & display"):
+        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = st.text_input("Anthropic API key", type="password", value=env_key)
+        use_llm = st.checkbox("Use LLM parsing", value=bool(env_key))
+        st.caption("Off, or on any LLM error → rule-based parser (works offline).")
+        time_unit = st.text_input("Time unit", value="months")
+        landmarks = _parse_landmarks(st.text_input("Landmark times for S(t)", value="12, 24"))
 
-    st.header("Display")
-    time_unit = st.text_input("Time unit", value="months")
-    landmarks = _parse_landmarks(st.text_input("Landmark times (for S(t))", value="12, 24"))
-
-    st.header("Examples")
-    for ex in EXAMPLES:
-        st.button(ex, key=f"ex_{ex}", on_click=_set_question, args=(ex,))
-
-
-# ============================================================================
-# 数据就绪检查
-# ============================================================================
-st.title("Survival Explorer")
-df = st.session_state.get("df")
-if df is None:
-    st.info("Upload a CSV or click **Load demo data** in the sidebar to start.")
-    st.stop()
-
-errors, data_warnings = check_data(df)
-st.caption(f"Dataset: **{st.session_state.get('df_name')}** — {len(df)} rows × {df.shape[1]} columns · "
-           f"outcomes: {', '.join(available_outcomes(df)) or 'none'}")
-if errors:
-    for e in errors:
-        st.error(e)
-    st.stop()
-if data_warnings:
-    with st.expander(f"{len(data_warnings)} data warning(s)"):
-        for w in data_warnings:
-            st.write("• " + w)
+    # 生存列:先自动识别(os_time/os_event、time_months/event 等),识别不了就让用户手动选
+    _cur = st.session_state.get("df")
+    if _cur is not None:
+        configure_outcomes(_cur)
+        _auto_ok = bool(available_outcomes(_cur))
+        with st.expander("Survival columns", expanded=not _auto_ok):
+            _num_cols = [c for c in _cur.columns if pd.api.types.is_numeric_dtype(_cur[c])
+                         and not pd.api.types.is_bool_dtype(_cur[c])]
+            _bin_cols = [c for c in _cur.columns if set(_cur[c].dropna().unique()) and
+                         set(_cur[c].dropna().unique()) <= {0, 1}]
+            _t_sel = st.selectbox("Time column", ["Auto-detect", *_num_cols], key="sv_time")
+            _e_sel = st.selectbox("Event column (1 = event occurred)", ["Auto-detect", *_bin_cols], key="sv_event")
+            _override = (_t_sel, _e_sel) if "Auto-detect" not in (_t_sel, _e_sel) else None
+            configure_outcomes(_cur, _override)
+            if available_outcomes(_cur):
+                st.caption("Using: " + "; ".join(f"{ui.OUTCOME_LABELS.get(k, k)} = {t} / {e}"
+                                                 for k, (t, e) in OUTCOME_MAP.items()))
+            else:
+                st.caption("No survival columns detected. Pick a numeric time column and a 0/1 event column.")
 
 
 def get_client():
@@ -142,139 +159,344 @@ def get_client():
 
 
 # ============================================================================
-# 提问
+# About 页(不需要数据)
 # ============================================================================
-question = st.text_input("Ask a question about the cohort", key="question",
-                         placeholder="e.g. overall survival for patients older than 65, by treatment")
-if st.button("Analyze", type="primary") and question.strip():
-    with st.spinner("Parsing and analyzing…"):
-        out = run_question(question, df, client=get_client(), use_llm=use_llm,
-                           time_unit=time_unit, landmarks=landmarks)
-    st.session_state["out"] = out
-    if out.parsed is not None:
-        st.session_state["query_json"] = json.dumps(out.parsed.query, ensure_ascii=False, indent=2)
+def render_about() -> None:
+    md(ui.section_header("About", "What this tool does and what it does not do", "sparkle"))
+    with st.container(border=True):
+        st.markdown(
+            """
+**What it does**
+- Turns a plain-English question into a structured, validated query (filters, outcome, grouping, plot type).
+- Draws Kaplan-Meier curves with log-rank tests, distributions, and trends for the selected cohort.
+- Trains an XGBoost Cox model and explains individual predictions with SHAP.
 
-out = st.session_state.get("out")
-left, right = st.columns([1, 2])
+**How questions are parsed**
+- With an API key and *Use LLM parsing* on, the question is sent to the Anthropic API together with the
+  column names, numeric ranges, and the values of low-cardinality categorical columns (e.g. sex, stage).
+  Identifiers, dates and other high-cardinality columns are never listed. **Patient-level rows are not sent.**
+- Every parsed query is validated against your data (columns, operators, values). If the LLM fails or returns
+  something invalid, a rule-based parser takes over, so the tool keeps working offline.
+- You can always read the parsed query and edit it before re-running.
 
-# ----------------------------------------------------------------------------
-# 左:Parsed Query 面板(可编辑后重跑)
-# ----------------------------------------------------------------------------
-with left:
-    st.subheader("Parsed Query")
-    if out is None or out.parsed is None:
-        st.caption("Ask a question to see how it is interpreted.")
-        if out is not None and out.error:
-            st.error(out.error)
-    else:
-        label = {"llm": "LLM", "rules": "Rule-based fallback", "manual": "Manually edited"}[out.parsed.source]
-        st.caption(f"Parsed by: **{label}**")
-        if out.parsed.notes:
-            with st.expander("Parser notes"):
-                for n in out.parsed.notes:
-                    st.write("• " + n)
-        st.text_area("Edit and re-run", key="query_json", height=280)
-        if st.button("Re-run edited query"):
-            try:
-                edited = json.loads(st.session_state["query_json"])
-            except json.JSONDecodeError as e:
-                st.error(f"Invalid JSON: {e}")
-            else:
-                st.session_state["out"] = run_parsed(edited, df, question=question, source="manual",
-                                                     time_unit=time_unit, landmarks=landmarks)
-                st.rerun()
+**Limitations**
+- Risk models are validated on a random internal split only; they are not a substitute for external or temporal
+  validation and are **not for clinical decision-making**.
+- SHAP shows what the model relies on, not causal effects.
+- Predicted risk levels (Low / Moderate / High) are relative to the training cohort.
+"""
+        )
 
-# ----------------------------------------------------------------------------
-# 右:结果
-# ----------------------------------------------------------------------------
-with right:
-    tab_plot, tab_table, tab_model, tab_data = st.tabs(["Plot", "Summary", "Risk model (XGBoost + SHAP)", "Data"])
 
-    with tab_plot:
-        if out is None:
-            st.info("Run a question to see the plot.")
-        elif out.error:
-            st.error(out.error)
+# ============================================================================
+# 页头 + 数据就绪检查
+# ============================================================================
+md(ui.header_html())
+if page == "About":
+    render_about()
+    st.stop()
+
+# 步骤卡先占位,等本次运行处理完提交/训练后再按最终状态填充(否则完成标记会慢一拍)
+steps_slot = st.empty() if page == "Overview" else None
+
+
+def update_steps() -> None:
+    if steps_slot is None:
+        return
+    o = st.session_state.get("out")
+    steps_slot.markdown(
+        ui.steps_html((st.session_state.get("df") is not None,
+                       o is not None and o.error is None,
+                       st.session_state.get("model") is not None)),
+        unsafe_allow_html=True)
+
+
+df = st.session_state.get("df")
+
+if df is None:
+    md('<div class="panel" style="margin-bottom:12px"><div class="panel-t">Get started</div>'
+       '<div class="muted" style="font-size:14.5px;line-height:1.6">Upload a clinical CSV in the sidebar, or try the '
+       'demo dataset. Your file needs a time column and a 0/1 event column for each outcome '
+       '(e.g. <code>os_time</code> / <code>os_event</code>).</div></div>')
+    st.button("Load demo data", key="demo_main", on_click=_use_demo)
+    update_steps()
+    st.stop()
+
+errors, data_warnings = check_data(df)
+if errors:
+    for err in errors:
+        st.error(err)
+    update_steps()
+    st.stop()
+st.caption(f"Dataset: **{st.session_state.get('df_name')}** · {len(df):,} patients · {df.shape[1]} columns · "
+           f"outcomes: {', '.join(available_outcomes(df))}")
+if data_warnings:
+    with st.expander(f"{len(data_warnings)} data warning(s)"):
+        for w in data_warnings:
+            st.write("• " + w)
+
+
+# ============================================================================
+# AI Cohort Explorer
+# ============================================================================
+def render_explorer(df: pd.DataFrame) -> None:
+    md(ui.section_header("AI Cohort Explorer", "Ask about your cohort in plain English.", "chart"))
+
+    with st.form("ask"):
+        c_in, c_btn = st.columns([8, 1.4])
+        with c_in:
+            question = st.text_input("Question", key="question", label_visibility="collapsed",
+                                     placeholder="e.g. Show overall survival by treatment group for patients older than 65")
+        with c_btn:
+            submitted = st.form_submit_button("Generate", type="primary")
+    if submitted and question.strip():
+        with st.spinner("Parsing and analyzing…"):
+            new_out = run_question(question, df, client=get_client(), use_llm=use_llm,
+                                   time_unit=time_unit, landmarks=landmarks)
+        st.session_state["out"] = new_out
+        if new_out.parsed is not None:
+            st.session_state["query_json"] = json.dumps(new_out.parsed.query, ensure_ascii=False, indent=2)
+
+    with st.expander("Example questions"):
+        for ex in EXAMPLES:
+            st.button(ex, key=f"ex_{ex}", on_click=_set_question, args=(ex,))
+
+    out = st.session_state.get("out")
+    if out is not None and out.error:
+        st.error(out.error)
+    res = out.result if out is not None else None
+
+    # ---- 三个信息面板:Parsed Query | Cohort Summary | Cohort Distribution ----
+    p_left, p_mid, p_right = st.columns([1.1, 1.35, 1.5])
+    with p_left:
+        if out is not None and out.parsed is not None:
+            md(ui.parsed_query_html(_clean_query_view(out.parsed.query), out.parsed.source))
         else:
-            res = out.result
-            st.caption(f"{res.n_selected} of {res.n_total} patients selected"
-                       + (f" · grouped by **{res.group_by}**" if res.group_by else ""))
-            for w in out.warnings:
-                st.warning(w)
-            st.pyplot(out.fig)
-            st.download_button("Download PNG", data=fig_to_png_bytes(out.fig),
-                               file_name="figure.png", mime="image/png")
-
-    with tab_table:
-        if out is None or out.error or out.report is None:
-            st.info("Survival statistics appear here for queries with an outcome.")
+            md(ui.parsed_query_placeholder())
+    with p_mid:
+        data = res.data if res is not None else df
+        event_col = res.event_col if res is not None else None
+        md(ui.tiles_html(ui.cohort_tiles(data, len(df), event_col)))
+    with p_right:
+        if res is not None:
+            label = ui.pretty_col(res.group_by) if res.group_by else "Cohort"
+            md(ui.distribution_html(label, ui.distribution_rows(res.groups) if res.group_by
+                                    else [("All selected patients", res.n_selected, 100.0)]))
         else:
-            rep = out.report
-            if rep.logrank is not None:
-                st.markdown(f"**Log-rank test:** {rep.logrank}")
-            summary = rep.summary.copy()
-            st.dataframe(summary.round(3).astype(object).where(summary.notna(), "NR"))
-            st.caption("NR = not reached. Median CI and S(t) use log-log 95% confidence intervals.")
-            if rep.pairwise is not None:
-                st.markdown("**Pairwise log-rank (Bonferroni-adjusted)**")
-                st.dataframe(rep.pairwise.round(4))
+            md(ui.distribution_placeholder())
 
-    # ------------------------------------------------------------------ 风险模型
-    with tab_model:
-        outcomes = available_outcomes(df)
-        sel = st.selectbox("Outcome to model", outcomes)
-        if st.button("Train XGBoost model"):
-            with st.spinner("Training…"):
-                try:
-                    m = SurvivalXGB(sel).fit(df)
-                    sample = df.sample(min(len(df), 2000), random_state=0)
-                    st.session_state["model"] = m
-                    st.session_state["shap_df"] = sample
-                    st.session_state["shap"] = m.shap_values(sample)
-                    st.session_state.pop("risk_out", None)
-                except (ImportError, ValueError) as e:
-                    st.error(str(e))
-
-        m = st.session_state.get("model")
-        if m is None:
-            st.info("Train a model to see risk predictions and SHAP explanations.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Patients / events", f"{int(m.metrics_['n'])} / {int(m.metrics_['events'])}")
-            c2.metric("C-index (validation)", f"{m.metrics_.get('c_index_val', float('nan')):.3f}")
-            c3.metric("C-index (train)", f"{m.metrics_['c_index_train']:.3f}")
-            st.caption("Internal random-split validation only — not a substitute for external or temporal "
-                       "validation. SHAP shows what the model uses, not causal effects.")
-
-            sr, sample = st.session_state["shap"], st.session_state["shap_df"]
-            g1, g2 = st.columns(2)
-            with g1:
-                fig = plot_shap_summary(sr); st.pyplot(fig); plt.close(fig)
-            with g2:
-                fig = plot_shap_bar(sr); st.pyplot(fig); plt.close(fig)
-
-            st.markdown("**Single patient**")
-            i = int(st.number_input("Row in the SHAP sample", min_value=0, max_value=len(sample) - 1, value=0, step=1))
-            fig = plot_shap_local(sr, i); st.pyplot(fig); plt.close(fig)
-            st.dataframe(m.predict_survival(sample.iloc[[i]], times=landmarks).round(3))
-
-            st.markdown("**Risk groups → Kaplan-Meier**")
-            if st.button("Plot KM by predicted risk group"):
-                df_r = df.copy()
-                df_r["risk_group"] = m.risk_group(df_r)
-                q = {"filters": [], "outcome": m.outcome, "group_by": "risk_group", "plot_type": "km_curve"}
-                st.session_state["risk_out"] = run_parsed(q, df_r, source="manual",
-                                                          time_unit=time_unit, landmarks=landmarks)
-            ro = st.session_state.get("risk_out")
-            if ro is not None:
-                if ro.error:
-                    st.error(ro.error)
+    # ---- 图 / 汇总 / 数据   |   查询编辑器 ----
+    c_plot, c_edit = st.columns([1.9, 1])
+    with c_plot:
+        with st.container(border=True):
+            tab_plot, tab_table, tab_data = st.tabs(["Plot", "Summary", "Data"])
+            with tab_plot:
+                if out is None:
+                    st.info("Run a question to see the plot.")
+                elif out.error:
+                    st.info("No plot to show. Check the message above or edit the query on the right.")
                 else:
-                    st.pyplot(ro.fig)
-                    st.caption("Risk groups are tertiles of predicted risk, computed on the same data the model "
-                               "was trained on, so separation is optimistic.")
+                    st.caption(f"{res.n_selected:,} of {res.n_total:,} patients selected"
+                               + (f" · grouped by **{res.group_by}**" if res.group_by else ""))
+                    for w in out.warnings:
+                        st.warning(w)
+                    st.pyplot(out.fig)
+                    st.download_button("Download PNG", data=fig_to_png_bytes(out.fig),
+                                       file_name="figure.png", mime="image/png")
+            with tab_table:
+                if out is None or out.error or out.report is None:
+                    st.info("Survival statistics appear here for queries with an outcome.")
+                else:
+                    rep = out.report
+                    if rep.logrank is not None:
+                        st.markdown(f"**Log-rank test:** {rep.logrank}")
+                    summary = rep.summary.copy()
+                    st.dataframe(summary.round(3).astype(object).where(summary.notna(), "NR"))
+                    st.caption("NR = not reached. Median CI and S(t) use log-log 95% confidence intervals.")
+                    if rep.pairwise is not None:
+                        st.markdown("**Pairwise log-rank (Bonferroni-adjusted)**")
+                        st.dataframe(rep.pairwise.round(4))
+            with tab_data:
+                st.dataframe(df.head(200))
+                st.dataframe(pd.DataFrame({"dtype": df.dtypes.astype(str), "missing": df.isna().sum(),
+                                           "unique": df.nunique()}))
 
-    with tab_data:
-        st.dataframe(df.head(200))
-        st.dataframe(pd.DataFrame({"dtype": df.dtypes.astype(str), "missing": df.isna().sum(),
-                                   "unique": df.nunique()}))
+    with c_edit:
+        with st.container(border=True):
+            md(ui.panel_title("Query editor", "code"))
+            if out is None or out.parsed is None:
+                st.caption("After you generate a query you can review and edit it here.")
+            else:
+                md(ui.chips_html(_clean_query_view(out.parsed.query)["filters"]))
+                st.text_area("Edit the query (JSON) and re-run", key="query_json", height=270)
+                if st.button("Re-run edited query"):
+                    try:
+                        edited = json.loads(st.session_state["query_json"])
+                    except json.JSONDecodeError as exc:
+                        st.error(f"Invalid JSON: {exc}")
+                    else:
+                        if not isinstance(edited, dict):
+                            st.error("The query must be a JSON object.")
+                        else:
+                            st.session_state["out"] = run_parsed(
+                                edited, df, question=st.session_state.get("question", ""),
+                                source="manual", time_unit=time_unit, landmarks=landmarks)
+                            st.rerun()
+                if out.parsed.notes:
+                    with st.expander("Parser notes"):
+                        for n in out.parsed.notes:
+                            st.write("• " + n)
+
+
+# ============================================================================
+# Patient Risk Prediction
+# ============================================================================
+def _field_widgets(m: SurvivalXGB, df: pd.DataFrame) -> dict:
+    """按模型特征自动生成病人输入表单(数值 -> number_input,分类 -> selectbox)。"""
+    values: dict = {}
+    cols = st.columns(2)
+    names = list(m.encoder.numeric) + list(m.encoder.categorical)
+    for i, col in enumerate(names):
+        label = ui.pretty_col(col)
+        with cols[i % 2]:
+            if col in m.encoder.numeric:
+                s = pd.to_numeric(df[col], errors="coerce").dropna()
+                if len(s) and (s == s.round()).all():
+                    values[col] = st.number_input(label, min_value=int(s.min()), max_value=int(s.max()),
+                                                  value=int(s.median()), step=1, key=f"pf_{col}")
+                else:
+                    values[col] = st.number_input(label, min_value=float(s.min()), max_value=float(s.max()),
+                                                  value=float(s.median()), key=f"pf_{col}")
+            else:
+                options = list(m.encoder.categorical[col])
+                mode = df[col].astype(str).mode()
+                idx = options.index(mode.iloc[0]) if len(mode) and mode.iloc[0] in options else 0
+                values[col] = st.selectbox(label, options, index=idx, key=f"pf_{col}")
+    return values
+
+
+def _predict_patient(m: SurvivalXGB, df: pd.DataFrame, values: dict, horizon: float) -> dict:
+    patient = pd.DataFrame([values])
+    surv_h = float(m.predict_survival(patient, [horizon]).iloc[0, 0])
+    lm = m.predict_survival(patient, landmarks).iloc[0]
+    unit = html.escape(time_unit)     # 这段会作为 HTML 渲染,用户输入必须转义
+    parts = " · ".join(f"{t:g} {unit}: {v * 100:.0f}%" for t, v in zip(landmarks, lm.to_numpy()))
+    details = f"Survival probability — {parts}<br>Risk level is relative to the training cohort."
+    if horizon > float(df[m.time_col].max()):
+        details += "<br><b>Horizon exceeds the longest follow-up in the data; interpret with caution.</b>"
+    label = EVENT_LABELS.get(m.outcome, "Event")
+    return {
+        "pct": (1 - surv_h) * 100,
+        "level": str(m.risk_group(patient).iloc[0]),
+        "title": f"{label} risk within {horizon:g} {time_unit}",
+        "details": details,
+        "shap": m.shap_values(patient),
+    }
+
+
+def render_risk(df: pd.DataFrame) -> None:
+    md(ui.section_header("Patient Risk Prediction",
+                         "Predict individual risk (e.g., 2-year mortality) and explain key drivers using SHAP.", "target"))
+
+    with st.container(border=True):
+        c_sel, c_btn, c_met = st.columns([1.4, 0.9, 3])
+        with c_sel:
+            md('<div class="muted" style="font-size:13px;margin-bottom:4px">Outcome to model</div>')
+            sel = st.selectbox("Outcome to model", available_outcomes(df), label_visibility="collapsed")
+        with c_btn:
+            md('<div style="height:26px"></div>')
+            train = st.button("Train model", type="primary")
+        if train:
+            with st.spinner("Training XGBoost model…"):
+                try:
+                    m_new = SurvivalXGB(sel).fit(df)
+                    sample = df.sample(min(len(df), 2000), random_state=0)
+                    st.session_state["model"] = m_new
+                    st.session_state["shap_df"] = sample
+                    st.session_state["shap"] = m_new.shap_values(sample)
+                    for k in ("risk_out", "patient_pred"):
+                        st.session_state.pop(k, None)
+                except (ImportError, ValueError) as exc:
+                    st.error(str(exc))
+        m = st.session_state.get("model")
+        with c_met:
+            if m is not None:
+                tiles = [
+                    {"n": f"{int(m.metrics_['n']):,}", "l": "Patients", "sub": f"{int(m.metrics_['events']):,} events"},
+                    {"n": f"{m.metrics_.get('c_index_val', float('nan')):.3f}", "l": "C-index (validation)", "sub": ""},
+                    {"n": f"{m.metrics_['c_index_train']:.3f}", "l": "C-index (train)", "sub": ""},
+                ]
+                md(ui.tiles_html(tiles, title=f"Model: {ui.OUTCOME_LABELS.get(m.outcome, m.outcome)}", ic="target"))
+
+    m = st.session_state.get("model")
+    if m is None:
+        st.info("Train a model to unlock individual risk predictions and SHAP explanations.")
+        return
+    st.caption("Internal random-split validation only; not a substitute for external or temporal validation, and "
+               "not for clinical decision-making. SHAP shows what the model uses, not causal effects.")
+
+    pred = st.session_state.get("patient_pred")
+    c_form, c_res, c_shap = st.columns([1.35, 1, 1.35])
+
+    with c_form:
+        with st.container(border=True):
+            md(ui.panel_title("Input Patient Features", "user"))
+            with st.form("patient"):
+                values = _field_widgets(m, df)
+                horizon = st.number_input(f"Prediction horizon ({time_unit})", min_value=1.0,
+                                          value=max(1.0, float(landmarks[-1])) if landmarks else 24.0, key="horizon")
+                go = st.form_submit_button("Predict Risk", type="primary")
+            if go:
+                st.session_state["patient_pred"] = pred = _predict_patient(m, df, values, float(horizon))
+
+    with c_res:
+        md(ui.panel_title("Prediction Result", "chart"))
+        if pred is None:
+            md(ui.risk_result_html("Predicted risk", None, None))
+        else:
+            md(ui.risk_result_html(pred["title"], pred["pct"], pred["level"], pred["details"]))
+
+    with c_shap:
+        with st.container(border=True):
+            md(ui.panel_title("SHAP Explanation (Top Features)", "sparkle"))
+            if pred is None:
+                st.caption("Appears after you click Predict Risk.")
+            else:
+                fig = plot_shap_local(pred["shap"], 0, max_display=6)
+                st.pyplot(fig)
+                plt.close(fig)
+
+    with st.expander("Model performance & global drivers"):
+        sr = st.session_state["shap"]
+        g1, g2 = st.columns(2)
+        with g1:
+            fig = plot_shap_summary(sr)
+            st.pyplot(fig)
+            plt.close(fig)
+        with g2:
+            fig = plot_shap_bar(sr)
+            st.pyplot(fig)
+            plt.close(fig)
+
+        st.markdown("**Risk groups → Kaplan-Meier**")
+        if st.button("Plot KM by predicted risk group"):
+            df_r = df.copy()
+            df_r["risk_group"] = m.risk_group(df_r)
+            q = {"filters": [], "outcome": m.outcome, "group_by": "risk_group", "plot_type": "km_curve"}
+            st.session_state["risk_out"] = run_parsed(q, df_r, source="manual", time_unit=time_unit,
+                                                      landmarks=landmarks)
+        ro = st.session_state.get("risk_out")
+        if ro is not None:
+            if ro.error:
+                st.error(ro.error)
+            else:
+                st.pyplot(ro.fig)
+                st.caption("Risk groups are tertiles of predicted risk, computed on the same data the model was "
+                           "trained on, so separation is optimistic.")
+
+
+if page in ("Overview", "Cohort Explorer"):
+    render_explorer(df)
+if page in ("Overview", "Risk Prediction"):
+    render_risk(df)
+update_steps()

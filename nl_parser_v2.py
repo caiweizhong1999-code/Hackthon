@@ -51,15 +51,15 @@ QUERY_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "column": {"type": "string", "description": "必须是数据中存在的列名"},
+                    "column": {"type": "string", "description": "Must be a column that exists in the data"},
                     "op": {"type": "string", "enum": sorted(ALLOWED_OPS)},
-                    "value": {"description": "数字/字符串;op 为 in 时为列表"},
+                    "value": {"description": "Number or string; a list when op is 'in'"},
                 },
                 "required": ["column", "op", "value"],
             },
         },
         "outcome": {"type": ["string", "null"], "enum": sorted(OUTCOME_MAP) + [None]},
-        "group_by": {"type": ["string", "null"], "description": "分类列名或 null"},
+        "group_by": {"type": ["string", "null"], "description": "Categorical column name or null"},
         "plot_type": {"type": "string", "enum": sorted(ALLOWED_PLOTS)},
     },
     "required": ["filters", "outcome", "group_by", "plot_type"],
@@ -106,10 +106,19 @@ def describe_schema(df: pd.DataFrame) -> str:
             lines.append(f"- {col} (numeric): min={s.min():g}, max={s.max():g}")
         else:
             vals = sorted(map(str, s.dropna().unique()))
-            shown = vals[:MAX_CATEGORIES_LISTED]
-            more = f", ... ({len(vals)} total)" if len(vals) > len(shown) else ""
-            lines.append(f"- {col} (categorical): {shown}{more}")
+            if len(vals) > MAX_CATEGORIES_LISTED:
+                # 高基数列(patient_id、日期等)只给个数,绝不列出取值:这份描述会发给 LLM,不能带上标识符
+                lines.append(f"- {col} (categorical, {len(vals)} distinct values; not listed)")
+            else:
+                lines.append(f"- {col} (categorical): {vals}")
     return "\n".join(lines)
+
+
+def _current_schema() -> dict[str, Any]:
+    """outcome 的可选值随数据集变化(OUTCOME_MAP 会被 configure_outcomes 改写),所以每次现算。"""
+    schema = json.loads(json.dumps(QUERY_JSON_SCHEMA))
+    schema["properties"]["outcome"]["enum"] = sorted(OUTCOME_MAP) + [None]
+    return schema
 
 
 def build_system_prompt(df: pd.DataFrame) -> str:
@@ -137,7 +146,7 @@ Rules:
 - If something in the question cannot be expressed with these columns, omit it rather than guess.
 
 JSON schema:
-{json.dumps(QUERY_JSON_SCHEMA, ensure_ascii=False)}
+{json.dumps(_current_schema(), ensure_ascii=False)}
 
 Examples:
 
@@ -174,11 +183,11 @@ def _extract_json(text: str) -> dict[str, Any]:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)   # 去掉可能的代码围栏
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
-        raise QueryError("返回内容里没有 JSON 对象")
+        raise QueryError("The response contains no JSON object")
     try:
         return json.loads(text[start:end + 1])
     except json.JSONDecodeError as e:
-        raise QueryError(f"JSON 解析失败: {e}")
+        raise QueryError(f"Could not parse JSON: {e}")
 
 
 def llm_parse(question: str, df: pd.DataFrame, client: Any, model: str = MODEL,
@@ -196,16 +205,16 @@ def llm_parse(question: str, df: pd.DataFrame, client: Any, model: str = MODEL,
         try:
             clean = validate_query(df, _extract_json(text))
             if attempt:
-                notes.append(f"LLM 在第 {attempt + 1} 次尝试后通过校验")
+                notes.append(f"LLM output passed validation on attempt {attempt + 1}")
             return ParseOutput(query=_to_public(clean), source="llm", notes=notes)
         except (QueryError, TypeError, AttributeError) as e:
             last_err = e
-            notes.append(f"第 {attempt + 1} 次校验失败: {e}")
+            notes.append(f"Attempt {attempt + 1} failed validation: {e}")
             messages += [
                 {"role": "assistant", "content": text},
                 {"role": "user", "content": f"That JSON is invalid: {e}\nReturn a corrected JSON object only."},
             ]
-    raise QueryError(f"LLM 重试 {max_retries} 次后仍不合格: {last_err}")
+    raise QueryError(f"LLM output still invalid after {max_retries} retries: {last_err}")
 
 
 # ----------------------------------------------------------------------------
@@ -336,7 +345,7 @@ def _find_group_by(q: str, df: pd.DataFrame) -> str | None:
 
 def rule_parse(question: str, df: pd.DataFrame) -> ParseOutput:
     q = question.lower()
-    notes: list[str] = ["使用规则解析(正则兜底)"]
+    notes: list[str] = ["Parsed with the rule-based fallback"]
     filters: list[dict[str, Any]] = []
 
     age_col = _find_column(df, "age")
@@ -372,7 +381,7 @@ def rule_parse(question: str, df: pd.DataFrame) -> ParseOutput:
         clean = validate_query(df, raw)
     except QueryError as e:
         # 规则结果也要过校验;失败就退化成最保守的全量 KM,而不是让界面报错
-        notes.append(f"规则解析结果未通过校验({e}),已退化为默认查询")
+        notes.append(f"Rule-based result failed validation ({e}); fell back to the default query")
         clean = validate_query(df, {"filters": [], "outcome": "overall_survival",
                                     "group_by": None, "plot_type": "km_curve"})
     return ParseOutput(query=_to_public(clean), source="rules", notes=notes)
@@ -385,14 +394,14 @@ def parse_query(question: str, df: pd.DataFrame, client: Any | None = None,
                 use_llm: bool = True, model: str = MODEL) -> ParseOutput:
     question = (question or "").strip()
     if not question:
-        raise QueryError("问题为空")
+        raise QueryError("The question is empty")
 
     if use_llm and client is not None:
         try:
             return llm_parse(question, df, client, model=model)
         except Exception as e:   # 校验耗尽、网络、超时、鉴权……一律兜底
             out = rule_parse(question, df)
-            out.notes.insert(0, f"LLM 解析失败,已回退到规则: {type(e).__name__}: {e}")
+            out.notes.insert(0, f"LLM parsing failed, fell back to rules: {type(e).__name__}: {e}")
             return out
     return rule_parse(question, df)
 

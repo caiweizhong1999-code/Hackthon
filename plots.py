@@ -20,7 +20,7 @@ from matplotlib.figure import Figure
 
 from survival import KMCurve, kaplan_meier, logrank_test
 
-PALETTE = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#ca8a04", "#64748b"]
+PALETTE = ["#2563eb", "#7c3aed", "#16a34a", "#ea580c", "#0891b2", "#ca8a04", "#db2777", "#64748b"]
 
 
 # ============================================================================
@@ -40,7 +40,7 @@ def _default_value_col(result: Any) -> str:
         return result.time_col
     num = result.data.select_dtypes("number").columns
     if len(num) == 0:
-        raise ValueError("数据中没有数值列可画")
+        raise ValueError("No numeric column available to plot")
     return num[0]
 
 
@@ -90,6 +90,7 @@ def plot_km(
         # 末尾延伸到最大随访时间
         ax.hlines(c.surv[-1], c.times[-1], x_max, color=col, lw=2)
 
+    ax.spines[["top", "right"]].set_visible(False)
     ax.set_ylim(0, 1.05)
     ax.set_xlim(0, x_max * 1.02)
     ax.set_ylabel("Survival probability")
@@ -120,6 +121,7 @@ def plot_km(
         ax_tbl.set_ylim(-0.5, len(curves) - 0.5)
         ax_tbl.set_yticks(range(len(curves)))
         ax_tbl.set_yticklabels(list(curves)[::-1], fontsize=8)
+        ax_tbl.tick_params(axis="y", pad=14)
         for i, (name, (t, _)) in enumerate(raw.items()):
             y = len(curves) - 1 - i
             for tk in ticks:
@@ -250,9 +252,9 @@ def render(result: Any, value_col: str | None = None, x_col: str | None = None,
 
     if pt == "km_curve":
         if not result.time_col:
-            raise ValueError("km_curve 需要 outcome")
+            raise ValueError("km_curve requires an outcome")
         return plot_km(groups, result.time_col, result.event_col,
-                       title=f"Kaplan-Meier: {result.outcome}{title_suffix}", time_unit=time_unit)
+                       title=f"{result.outcome.replace('_', ' ').capitalize()}{title_suffix}", time_unit=time_unit)
 
     col = value_col or _default_value_col(result)
     if pt == "histogram":
@@ -264,7 +266,7 @@ def render(result: Any, value_col: str | None = None, x_col: str | None = None,
     if pt in ("scatter", "trend"):
         x = x_col or ("age" if "age" in result.data.columns else result.data.select_dtypes("number").columns[0])
         return plot_trend(groups, x, col) if pt == "trend" else plot_scatter(groups, x, col)
-    raise ValueError(f"未知 plot_type: {pt}")
+    raise ValueError(f"Unknown plot_type: {pt}")
 
 
 # ----------------------------------------------------------------------------
