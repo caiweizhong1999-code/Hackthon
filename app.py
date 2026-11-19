@@ -511,7 +511,8 @@ def render_risk(df: pd.DataFrame) -> None:
                 st.caption("Appears after you click Predict Risk.")
             else:
                 fig = plot_shap_local(pred["shap"], 0, max_display=6)
-                st.pyplot(fig)
+                # st.pyplot here was sized to 16px wide (Streamlit layout quirk); a fixed-width PNG is shrunk to the column by CSS
+                st.image(fig_to_png_bytes(fig), width=900)
                 plt.close(fig)
 
     with st.expander("Model performance & global drivers"):
