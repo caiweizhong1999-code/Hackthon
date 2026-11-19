@@ -1,5 +1,23 @@
 # AI-Powered Clinical Data Explorer
 
+## 🎬 Demo
+
+<p align="center">
+  <a href="demo_video/demo.mp4">
+    <img src="demo_video/demo_preview.gif" alt="Demo: ask a question in plain English, get Kaplan-Meier curves, then predict and explain patient risk" width="820">
+  </a>
+</p>
+
+<p align="center">
+  <b><a href="demo_video/demo.mp4">▶ Watch the full 2.5-minute narrated walkthrough (MP4)</a></b><br>
+  Upload data → ask a question → Kaplan-Meier, summary table and Table 1 → edit the query → train XGBoost → predict and explain one patient with SHAP
+</p>
+
+The video is generated automatically by [`demo_video/make_demo_video.py`](demo_video/make_demo_video.py)
+(Playwright drives the app in Chrome, edge-tts narrates, ffmpeg muxes). To re-create it:
+`pip install playwright imageio-ffmpeg edge-tts && python -m playwright install ffmpeg && python demo_video/make_demo_video.py`.
+
+
 ## What's new in version 3
 
 - `synthetic_clinical.csv` now has **progression-free survival** (`pfs_time`, `pfs_event`); the overall-survival
@@ -21,6 +39,7 @@ predictions with SHAP explanations**, without writing code.
 
 ## Table of contents
 
+1. [Demo](#-demo)
 1. [Features](#features)
 2. [How it works](#how-it-works)
 3. [Quick start](#quick-start)

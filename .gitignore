@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 .env
 models/
+demo_video/build/
+demo_video/voice_samples/
+demo_video/demo_video.mp4
